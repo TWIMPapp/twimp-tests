@@ -6,7 +6,11 @@
   "scripts": {
     "test": "node tests/custom-trail.e2e.mjs",
     "test:api": "node tests/custom-trail.api.mjs",
-    "test:browser": "node tests/custom-trail.browser.mjs"
+    "test:multiplayer": "node tests/multiplayer.api.mjs",
+    "test:competitive": "node tests/competitive.api.mjs",
+    "test:edge-cases": "node tests/edge-cases.api.mjs",
+    "test:race": "node tests/race-conditions.api.mjs",
+    "test:all-api": "node tests/custom-trail.api.mjs && node tests/multiplayer.api.mjs && node tests/competitive.api.mjs && node tests/edge-cases.api.mjs && node tests/race-conditions.api.mjs"
   },
   "dependencies": {
     "puppeteer": "^22.0.0"

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Melissa's Trail — Full Walk Simulation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e5e7eb; }
+        #map { width: 100%; height: 60vh; }
+        #controls { padding: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+        #log { padding: 16px; height: 30vh; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 13px; line-height: 1.6; background: #1a1b23; border-top: 1px solid #2d2f3a; }
+        button { padding: 8px 20px; border: none; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer; }
+        #startBtn { background: #22c55e; color: white; }
+        #startBtn:disabled { background: #374151; color: #6b7280; cursor: not-allowed; }
+        #resetBtn { background: #ef4444; color: white; }
+        #status { color: #9ca3af; font-size: 13px; }
+        .log-line { margin-bottom: 2px; }
+        .log-ok { color: #22c55e; }
+        .log-warn { color: #f59e0b; }
+        .log-err { color: #ef4444; }
+        .log-info { color: #60a5fa; }
+        .log-dim { color: #6b7280; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="controls">
+        <button id="startBtn" onclick="runTest()">Start Walk Simulation</button>
+        <button id="resetBtn" onclick="resetSession()">Reset Session</button>
+        <span id="status">Ready — click Start to walk the full trail (Pin 0 → 1 → 2 → 3 → 4 → 5)</span>
+    </div>
+    <div id="log"></div>
+
+    <script>
+        const API = 'https://api.twimp.app';
+        const TRAIL_ID = 'melissa';
+        const userId = `visual_test_${Date.now()}`;
+
+        // Trail pin positions
+        const PINS = [
+            { lat: 50.77004324738618, lng: -2.012566035239951, label: 'Pin 0 (first)', msg: 'Happy Valentine\'s Day. Wouldn\'t it be nice...' },
+            { lat: 50.769720945243,   lng: -2.0136308722188634, label: 'Pin 1', msg: 'At the end of our first date...' },
+            { lat: 50.770273946504,   lng: -2.0132231764485997, label: 'Pin 2', msg: 'You\'re always cold...' },
+            { lat: 50.770785282643246, lng: -2.012370233981864, label: 'Pin 3', msg: 'You came and nursed my foot...' },
+            { lat: 50.77204391609381, lng: -2.0115370709734592, label: 'Pin 4', msg: 'You tolerate my terrible memory...' },
+            { lat: 50.77125854636381, lng: -2.011097188695017, label: 'Pin 5 (last)', msg: 'Happy Valentine\'s Day. I love you...' }
+        ];
+
+        // Simulate a walk: start near pin 0, then walk directly toward pin 5
+        // Generate waypoints every ~5m along the path
+        function generateWalkPath(from, to, stepMeters = 5) {
+            const points = [];
+            const R = 6371000;
+            const dLat = (to.lat - from.lat) * Math.PI / 180;
+            const dLng = (to.lng - from.lng) * Math.PI / 180;
+            const totalDist = Math.sqrt(
+                Math.pow(dLat * R, 2) +
+                Math.pow(dLng * R * Math.cos(from.lat * Math.PI / 180), 2)
+            );
+            const steps = Math.ceil(totalDist / stepMeters);
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                points.push({
+                    lat: from.lat + (to.lat - from.lat) * t,
+                    lng: from.lng + (to.lng - from.lng) * t
+                });
+            }
+            return points;
+        }
+
+        let map, playerMarker, pinMarkers = [], pathLine, collectionCircles = [];
+        const PIN_COLORS = ['#22c55e', '#60a5fa', '#a78bfa', '#f472b6', '#f59e0b', '#ef4444'];
+
+        function initMap() {
+            map = new google.maps.Map(document.getElementById('map'), {
+                center: { lat: 50.7710, lng: -2.0123 },
+                zoom: 17,
+                mapTypeId: 'satellite',
+                disableDefaultUI: true,
+                zoomControl: true
+            });
+
+            // Draw pins
+            PINS.forEach((pin, i) => {
+                const marker = new google.maps.Marker({
+                    position: { lat: pin.lat, lng: pin.lng },
+                    map,
+                    label: { text: String(i), color: 'white', fontWeight: 'bold' },
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 14,
+                        fillColor: PIN_COLORS[i],
+                        fillOpacity: 0.9,
+                        strokeColor: 'white',
+                        strokeWeight: 2
+                    },
+                    title: pin.label
+                });
+                pinMarkers.push(marker);
+
+                // Collection radius circle (30m)
+                collectionCircles.push(new google.maps.Circle({
+                    center: { lat: pin.lat, lng: pin.lng },
+                    radius: 30,
+                    map,
+                    fillColor: PIN_COLORS[i],
+                    fillOpacity: 0.08,
+                    strokeColor: PIN_COLORS[i],
+                    strokeOpacity: 0.3,
+                    strokeWeight: 1
+                }));
+            });
+
+            // Player marker (blue dot)
+            playerMarker = new google.maps.Marker({
+                position: PINS[0],
+                map,
+                icon: {
+                    path: google.maps.SymbolPath.CIRCLE,
+                    scale: 8,
+                    fillColor: '#3b82f6',
+                    fillOpacity: 1,
+                    strokeColor: 'white',
+                    strokeWeight: 2
+                },
+                zIndex: 100,
+                title: 'Player'
+            });
+        }
+
+        function log(text, cls = '') {
+            const el = document.getElementById('log');
+            const line = document.createElement('div');
+            line.className = `log-line ${cls}`;
+            line.textContent = text;
+            el.appendChild(line);
+            el.scrollTop = el.scrollHeight;
+        }
+
+        async function post(endpoint, body) {
+            const res = await fetch(`${API}/${endpoint}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            return data.body || data;
+        }
+
+        function setStatus(text) {
+            document.getElementById('status').textContent = text;
+        }
+
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        function markPinCollected(index) {
+            pinMarkers[index].setIcon({
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 14,
+                fillColor: '#22c55e',
+                fillOpacity: 0.9,
+                strokeColor: 'white',
+                strokeWeight: 3
+            });
+            collectionCircles[index].setOptions({
+                fillColor: '#22c55e',
+                fillOpacity: 0.15,
+                strokeColor: '#22c55e',
+                strokeOpacity: 0.6
+            });
+        }
+
+        async function runTest() {
+            const btn = document.getElementById('startBtn');
+            btn.disabled = true;
+            document.getElementById('log').innerHTML = '';
+
+            log(`User ID: ${userId}`, 'log-dim');
+            log(`Trail: ${TRAIL_ID}`, 'log-dim');
+            log('');
+
+            // Step 1: Start game from ~50m before pin 0 (simulating starting from nearby)
+            const startPos = { lat: PINS[0].lat + 0.0003, lng: PINS[0].lng - 0.0003 }; // ~40m from pin 0
+            playerMarker.setPosition(startPos);
+
+            log('Starting game ~40m from Pin 0...', 'log-info');
+            setStatus('Starting game...');
+
+            const playResult = await post('play', {
+                game_ref: `custom-trail-${TRAIL_ID}`,
+                user_id: userId,
+                lat: startPos.lat,
+                lng: startPos.lng
+            });
+
+            if (!playResult.ok) {
+                log(`Failed to start: ${playResult.message}`, 'log-err');
+                btn.disabled = false;
+                return;
+            }
+
+            log(`Game started — currentPinIndex=${playResult.session.currentPinIndex}, mode=custom`, 'log-ok');
+            log('');
+
+            // Step 2: Build full walk path: start → pin 0 → pin 1 → pin 2 → pin 3 → pin 4 → pin 5
+            const fullPath = [];
+            const waypoints = [startPos, ...PINS];
+            for (let w = 0; w < waypoints.length - 1; w++) {
+                const segment = generateWalkPath(waypoints[w], waypoints[w + 1], 3);
+                // Skip first point of each segment after the first to avoid duplicates
+                if (w > 0) segment.shift();
+                fullPath.push(...segment);
+            }
+
+            log(`Walking full trail: ${fullPath.length} GPS positions`, 'log-info');
+            log(`Route: Start → Pin 0 → Pin 1 → Pin 2 → Pin 3 → Pin 4 → Pin 5`, 'log-info');
+            log('');
+
+            // Draw path on map
+            if (pathLine) pathLine.setMap(null);
+            pathLine = new google.maps.Polyline({
+                path: fullPath,
+                map,
+                strokeColor: '#3b82f6',
+                strokeOpacity: 0.6,
+                strokeWeight: 3
+            });
+
+            // Fit map to show entire path
+            const bounds = new google.maps.LatLngBounds();
+            fullPath.forEach(p => bounds.extend(p));
+            map.fitBounds(bounds, 60);
+
+            // Step 3: Walk the full path, polling AWTY regularly
+            let collected = [];
+            let trailComplete = false;
+            const POLL_EVERY = 5; // Poll every 5 positions (~15m of walking)
+
+            for (let i = 0; i < fullPath.length; i++) {
+                const pos = fullPath[i];
+                playerMarker.setPosition(pos);
+                setStatus(`Walking... step ${i + 1}/${fullPath.length} | Collected: ${collected.length}/6`);
+
+                if (i % POLL_EVERY === 0 || i === fullPath.length - 1) {
+                    const awty = await post('awty', {
+                        game_ref: `custom-trail-${TRAIL_ID}`,
+                        user_id: userId,
+                        lat: pos.lat,
+                        lng: pos.lng
+                    });
+
+                    if (awty.collected) {
+                        const pinIdx = awty.session?.currentPinIndex - 1;
+                        collected.push(pinIdx);
+                        markPinCollected(pinIdx);
+                        log(`[step ${i}] COLLECTED Pin ${pinIdx}! "${awty.successMessage?.substring(0, 60)}..."`, 'log-ok');
+
+                        if (awty.completed) {
+                            log('');
+                            log('TRAIL COMPLETED!', 'log-ok');
+                            trailComplete = true;
+                            break;
+                        }
+                    } else if (awty.arrived && awty.task) {
+                        log(`[step ${i}] Arrived at question pin — ${awty.task.content}`, 'log-warn');
+                    } else if (awty.hint) {
+                        // Only log hint changes to reduce noise
+                        const dist = awty.distance;
+                        if (dist !== undefined && dist < 60) {
+                            log(`[step ${i}] ${awty.hint} (${dist}m to next pin)`, 'log-dim');
+                        }
+                    } else if (awty.completed) {
+                        log('Trail already completed!', 'log-ok');
+                        trailComplete = true;
+                        break;
+                    }
+                }
+
+                await sleep(40); // 40ms between positions for smooth animation
+            }
+
+            log('');
+            log(`=== Walk complete ===`, 'log-info');
+            log(`Pins collected in order: [${collected.join(', ')}]`, collected.length > 0 ? 'log-ok' : 'log-warn');
+            log(`Total collected: ${collected.length}/6`, trailComplete ? 'log-ok' : 'log-warn');
+
+            if (trailComplete && collected.length === 6) {
+                log('');
+                log('All 6 pins collected in sequential order — trail working perfectly!', 'log-ok');
+            } else if (!trailComplete) {
+                log('');
+                log('Trail did NOT complete — some pins may have been missed.', 'log-err');
+                log('This could mean the walk path didn\'t pass close enough to a pin.', 'log-dim');
+            }
+
+            setStatus(trailComplete ? 'Trail completed!' : 'Walk finished');
+            btn.disabled = false;
+        }
+
+        async function resetSession() {
+            log('Resetting session...', 'log-info');
+            await post('next', {
+                game_ref: `custom-trail-${TRAIL_ID}`,
+                user_id: userId,
+                action: 'restart'
+            });
+            log('Session reset.', 'log-ok');
+
+            // Reset pin colors
+            PINS.forEach((pin, i) => {
+                pinMarkers[i]?.setIcon({
+                    path: google.maps.SymbolPath.CIRCLE,
+                    scale: 14,
+                    fillColor: PIN_COLORS[i],
+                    fillOpacity: 0.9,
+                    strokeColor: 'white',
+                    strokeWeight: 2
+                });
+                collectionCircles[i]?.setOptions({
+                    fillColor: PIN_COLORS[i],
+                    fillOpacity: 0.08,
+                    strokeColor: PIN_COLORS[i],
+                    strokeOpacity: 0.3
+                });
+            });
+
+            if (pathLine) { pathLine.setMap(null); pathLine = null; }
+            playerMarker?.setPosition(PINS[0]);
+        }
+    </script>
+    <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBvVKx3gK4-AdFH1EAjv0btTYXonqPTess&callback=initMap"></script>
+</body>
+</html>

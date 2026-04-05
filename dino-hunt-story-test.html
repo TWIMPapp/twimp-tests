@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dino Hunt — Full Game + Battle Story Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e5e7eb; }
+        #map { width: 100%; height: 40vh; }
+        #controls { padding: 12px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #2d2f3a; }
+        #log { padding: 16px; height: 25vh; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 13px; line-height: 1.6; background: #1a1b23; border-top: 1px solid #2d2f3a; }
+        #story-panel { padding: 20px; max-height: 35vh; overflow-y: auto; background: #1e2030; border-top: 2px solid #a855f7; display: none; }
+        #story-panel h2 { color: #a855f7; margin-bottom: 12px; font-size: 16px; }
+        #story-panel .story-text { color: #e5e7eb; font-size: 15px; line-height: 1.8; white-space: pre-wrap; }
+        #story-panel .army-list { margin-top: 16px; padding-top: 12px; border-top: 1px solid #2d2f3a; }
+        #story-panel .dino-card { display: inline-block; background: #2d2f3a; border-radius: 8px; padding: 6px 12px; margin: 4px; font-size: 12px; }
+        #story-panel .dino-card.epic { border-left: 3px solid #f59e0b; }
+        #story-panel .dino-card.rare { border-left: 3px solid #a855f7; }
+        #story-panel .dino-card.common { border-left: 3px solid #6b7280; }
+        button { padding: 8px 20px; border: none; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer; }
+        #startBtn { background: #22c55e; color: white; }
+        #startBtn:disabled { background: #374151; color: #6b7280; cursor: not-allowed; }
+        #regenBtn { background: #a855f7; color: white; }
+        #regenBtn:disabled { background: #374151; color: #6b7280; cursor: not-allowed; }
+        #resetBtn { background: #ef4444; color: white; }
+        #status { color: #9ca3af; font-size: 13px; flex: 1; }
+        .log-line { margin-bottom: 2px; }
+        .log-ok { color: #22c55e; }
+        .log-warn { color: #f59e0b; }
+        .log-err { color: #ef4444; }
+        .log-info { color: #60a5fa; }
+        .log-dim { color: #6b7280; }
+        .log-epic { color: #f59e0b; font-weight: bold; }
+        .log-rare { color: #a855f7; }
+        .log-common { color: #6b7280; }
+        .api-toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #9ca3af; }
+        .api-toggle select { background: #1a1b23; color: #e5e7eb; border: 1px solid #2d2f3a; border-radius: 4px; padding: 4px 8px; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="controls">
+        <button id="startBtn" onclick="runFullGame()">Run Full Game</button>
+        <button id="regenBtn" onclick="regenerateStory()" disabled>Regenerate Story</button>
+        <button id="resetBtn" onclick="resetSession()">Reset</button>
+        <span class="api-toggle">
+            API:
+            <select id="apiSelect">
+                <option value="http://localhost:3001">localhost:3001</option>
+                <option value="https://api.twimp.app">api.twimp.app (live)</option>
+            </select>
+        </span>
+        <span id="status">Ready — "Run Full Game" plays through all eggs, "Regenerate Story" re-runs just the story</span>
+    </div>
+    <div id="story-panel">
+        <h2 id="storyHeader">Battle Story</h2>
+        <div class="story-text" id="storyText"></div>
+        <div class="army-list" id="armyList"></div>
+    </div>
+    <div id="log"></div>
+
+    <script>
+        function getAPI() { return document.getElementById('apiSelect').value; }
+
+        const userId = `dino_test_${Date.now()}`;
+
+        // Starting position from the provided session
+        const START_POSITION = { lat: 50.70322263364386, lng: -1.9381303952324247 };
+
+        // Fun nicknames for the dinos
+        const NICKNAMES = [
+            'Chompy', 'Big Boi', 'Swoosh', 'Zippy', 'Bubbles',
+            'Tank', 'Wobbles', 'Rex Jr', 'Brainiac', 'Spike'
+        ];
+
+        const EGG_EMOJIS = {
+            aggressive: '😡', biggest: '🏔️', flying: '🦅', fastest: '⚡',
+            sea: '🌊', armoured: '🛡️', weirdest: '🤪', deadliest: '💀',
+            smartest: '🧠', horns_spikes: '🦏'
+        };
+        const EGG_COLORS = {
+            aggressive: '#EF4444', biggest: '#F97316', flying: '#38BDF8', fastest: '#FACC15',
+            sea: '#3B82F6', armoured: '#6B7280', weirdest: '#A855F7', deadliest: '#1F2937',
+            smartest: '#22C55E', horns_spikes: '#92400E'
+        };
+
+        let map, playerMarker, startMarker;
+        let pinMarkers = [], collectionCircles = [];
+        let collectedDinos = [];
+        let storyCount = 0;
+
+        function initMap() {
+            map = new google.maps.Map(document.getElementById('map'), {
+                center: START_POSITION,
+                zoom: 16,
+                mapTypeId: 'satellite',
+                disableDefaultUI: true,
+                zoomControl: true
+            });
+
+            // Start position marker (golden egg return point)
+            startMarker = new google.maps.Marker({
+                position: START_POSITION,
+                map,
+                label: { text: '⭐', fontSize: '18px' },
+                icon: {
+                    path: google.maps.SymbolPath.CIRCLE,
+                    scale: 16,
+                    fillColor: '#FFD700',
+                    fillOpacity: 0.3,
+                    strokeColor: '#FFD700',
+                    strokeOpacity: 0.5,
+                    strokeWeight: 2
+                },
+                title: 'Start / Golden Egg'
+            });
+
+            // Player marker
+            playerMarker = new google.maps.Marker({
+                position: START_POSITION,
+                map,
+                icon: {
+                    path: google.maps.SymbolPath.CIRCLE,
+                    scale: 8,
+                    fillColor: '#3b82f6',
+                    fillOpacity: 1,
+                    strokeColor: 'white',
+                    strokeWeight: 2
+                },
+                zIndex: 100,
+                title: 'Player'
+            });
+        }
+
+        // Draw egg markers on the map from server data
+        function drawEggs(eggs) {
+            // Clear old markers
+            pinMarkers.forEach(m => m.setMap(null));
+            collectionCircles.forEach(c => c.setMap(null));
+            pinMarkers = [];
+            collectionCircles = [];
+
+            eggs.forEach((egg, i) => {
+                const color = EGG_COLORS[egg.categoryId] || '#888';
+                const emoji = EGG_EMOJIS[egg.categoryId] || '🥚';
+                const marker = new google.maps.Marker({
+                    position: { lat: egg.lat, lng: egg.lng },
+                    map,
+                    label: { text: emoji, fontSize: '18px' },
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 16,
+                        fillColor: color,
+                        fillOpacity: 0.85,
+                        strokeColor: 'white',
+                        strokeWeight: 2
+                    },
+                    title: `Egg ${egg.eggIndex} (${egg.categoryId})`
+                });
+                pinMarkers.push(marker);
+
+                collectionCircles.push(new google.maps.Circle({
+                    center: { lat: egg.lat, lng: egg.lng },
+                    radius: 30,
+                    map,
+                    fillColor: color,
+                    fillOpacity: 0.06,
+                    strokeColor: color,
+                    strokeOpacity: 0.25,
+                    strokeWeight: 1
+                }));
+            });
+
+            // Fit map to show all eggs
+            const bounds = new google.maps.LatLngBounds();
+            bounds.extend(START_POSITION);
+            eggs.forEach(e => bounds.extend({ lat: e.lat, lng: e.lng }));
+            map.fitBounds(bounds, 40);
+        }
+
+        function markEggCollected(eggIndex) {
+            // Find the marker by matching eggIndex (markers are in order)
+            const idx = pinMarkers.findIndex((m, i) => m.getTitle()?.startsWith(`Egg ${eggIndex}`));
+            if (idx === -1) return;
+            pinMarkers[idx].setIcon({
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 16,
+                fillColor: '#22c55e',
+                fillOpacity: 0.9,
+                strokeColor: 'white',
+                strokeWeight: 3
+            });
+            pinMarkers[idx].setLabel({ text: '✓', color: 'white', fontWeight: 'bold', fontSize: '14px' });
+            collectionCircles[idx]?.setOptions({
+                fillColor: '#22c55e', fillOpacity: 0.12,
+                strokeColor: '#22c55e', strokeOpacity: 0.5
+            });
+        }
+
+        function log(text, cls = '') {
+            const el = document.getElementById('log');
+            const line = document.createElement('div');
+            line.className = `log-line ${cls}`;
+            line.textContent = text;
+            el.appendChild(line);
+            el.scrollTop = el.scrollHeight;
+        }
+
+        async function post(endpoint, body) {
+            const API = getAPI();
+            const res = await fetch(`${API}/${endpoint}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            return data.body || data;
+        }
+
+        function setStatus(text) {
+            document.getElementById('status').textContent = text;
+        }
+
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        function showStory(story, army) {
+            storyCount++;
+            const panel = document.getElementById('story-panel');
+            const isFallback = story.includes('The moment had come') && story.includes('mind-control machine');
+            document.getElementById('storyHeader').textContent = isFallback
+                ? `Battle Story #${storyCount} (FALLBACK)`
+                : `Battle Story #${storyCount} (AI Generated)`;
+            document.getElementById('storyHeader').style.color = isFallback ? '#ef4444' : '#a855f7';
+            document.getElementById('storyText').textContent = story;
+
+            const armyEl = document.getElementById('armyList');
+            armyEl.innerHTML = '<strong style="color:#9ca3af;font-size:13px;">Your Army:</strong><br>';
+            army.forEach(d => {
+                const card = document.createElement('span');
+                card.className = `dino-card ${d.rarity}`;
+                card.textContent = `${d.nickname} (${d.name}) — ${d.rarity.toUpperCase()} — Total: ${d.total}`;
+                armyEl.appendChild(card);
+            });
+
+            panel.style.display = 'block';
+        }
+
+        function setButtonsDisabled(disabled) {
+            document.getElementById('startBtn').disabled = disabled;
+            document.getElementById('regenBtn').disabled = disabled;
+        }
+
+        // ===== Core: start game, collect all eggs, return the server's egg data =====
+        async function startAndCollectAll() {
+            // Reset first
+            await post('next', { game_ref: 'dino-hunt', user_id: userId, action: 'restart' });
+
+            // Start game
+            const playResult = await post('play', {
+                game_ref: 'dino-hunt', user_id: userId,
+                lat: START_POSITION.lat, lng: START_POSITION.lng
+            });
+            if (!playResult.ok) {
+                log(`Failed to start: ${playResult.message}`, 'log-err');
+                return null;
+            }
+            log(`Game started — phase: ${playResult.session.phase}`, 'log-ok');
+
+            // Choose favorite dino
+            log('Choosing favorite dino (T-Rex)...', 'log-info');
+            const chooseResult = await post('next', {
+                game_ref: 'dino-hunt', user_id: userId,
+                action: 'choose-dino', dino_id: 'trex'
+            });
+            if (!chooseResult.ok) {
+                log(`Failed to choose dino: ${chooseResult.message}`, 'log-err');
+                return null;
+            }
+
+            // Get the server's actual eggs
+            const serverEggs = chooseResult.eggs;
+            log(`${serverEggs.length} eggs spawned by server`, 'log-ok');
+            drawEggs(serverEggs);
+            log('');
+
+            // Collect all 10 eggs
+            collectedDinos = [];
+            for (let i = 0; i < 10; i++) {
+                // Get current state to find uncollected eggs
+                const awtyCheck = await post('awty', {
+                    game_ref: 'dino-hunt', user_id: userId,
+                    lat: START_POSITION.lat, lng: START_POSITION.lng
+                });
+
+                if (awtyCheck.phase === 'golden_egg') {
+                    log('All eggs collected!', 'log-ok');
+                    break;
+                }
+
+                const eggs = awtyCheck.eggs || awtyCheck.session?.eggs;
+                const nextEgg = eggs?.find(e => !e.collected);
+                if (!nextEgg) {
+                    log('No uncollected eggs found!', 'log-warn');
+                    break;
+                }
+
+                const eggIdx = nextEgg.eggIndex;
+                const catId = nextEgg.categoryId;
+                const emoji = EGG_EMOJIS[catId] || '🥚';
+                setStatus(`Collecting egg ${i + 1}/10 — ${emoji} ${catId}...`);
+
+                // Teleport to egg
+                playerMarker.setPosition({ lat: nextEgg.lat, lng: nextEgg.lng });
+
+                // Arrive at egg
+                const arriveResult = await post('awty', {
+                    game_ref: 'dino-hunt', user_id: userId,
+                    lat: nextEgg.lat, lng: nextEgg.lng
+                });
+
+                if (!arriveResult.arrived) {
+                    log(`[Egg ${eggIdx}] ${emoji} ${catId} — did not arrive (dist=${arriveResult.nearestDistance}m)`, 'log-err');
+                    continue;
+                }
+
+                // Answer question (index 0)
+                const question = arriveResult.question;
+                const answerResult = await post('next', {
+                    game_ref: 'dino-hunt', user_id: userId,
+                    action: 'answer-question',
+                    answer_index: 0,
+                    option_rarities: question._optionRarities
+                });
+
+                if (!answerResult.ok) {
+                    log(`[Egg ${eggIdx}] Answer failed: ${answerResult.message}`, 'log-err');
+                    continue;
+                }
+
+                const dino = answerResult.dinosaur;
+
+                // Name the dino
+                const nickname = NICKNAMES[i] || `Dino${i}`;
+                const nameResult = await post('next', {
+                    game_ref: 'dino-hunt', user_id: userId,
+                    action: 'name-dino', nickname, dino_data: dino
+                });
+
+                if (!nameResult.ok) {
+                    log(`[Egg ${eggIdx}] Naming failed: ${nameResult.message}`, 'log-err');
+                    continue;
+                }
+
+                collectedDinos.push(nameResult.collectedDino);
+                markEggCollected(eggIdx);
+                const rarityClass = `log-${dino.rarity}`;
+                log(`[Egg ${eggIdx}] ${emoji} ${catId} → ${dino.name} (${dino.rarity.toUpperCase()}) → "${nickname}" [${nameResult.collectedCount}/10]`, rarityClass);
+
+                if (nameResult.goldenEggSpawned) {
+                    log('');
+                    log('All 10 eggs collected! Golden egg spawned!', 'log-epic');
+                }
+            }
+
+            return true;
+        }
+
+        // ===== Collect golden egg and get story =====
+        async function collectGoldenEggAndShowStory() {
+            // Walk to golden egg
+            playerMarker.setPosition(START_POSITION);
+            const goldenAwty = await post('awty', {
+                game_ref: 'dino-hunt', user_id: userId,
+                lat: START_POSITION.lat, lng: START_POSITION.lng
+            });
+
+            if (!goldenAwty.arrived) {
+                log(`Not at golden egg? ${JSON.stringify(goldenAwty)}`, 'log-err');
+                return;
+            }
+            log('Arrived at golden egg — generating story...', 'log-epic');
+            setStatus('Generating battle story... (waiting for AI)');
+
+            const startTime = Date.now();
+            const goldenResult = await post('next', {
+                game_ref: 'dino-hunt', user_id: userId,
+                action: 'collect-golden-egg'
+            });
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+            if (!goldenResult.ok) {
+                log(`Golden egg failed: ${goldenResult.message}`, 'log-err');
+                return;
+            }
+
+            const story = goldenResult.battleStory;
+            const army = goldenResult.army || collectedDinos;
+            const isFallback = story.includes('The moment had come') && story.includes('mind-control machine');
+
+            log('');
+            if (isFallback) {
+                log(`FALLBACK STORY (AI failed) — ${elapsed}s`, 'log-err');
+                log('Check vercel dev terminal for [AIService] and [DinoHunt] logs', 'log-warn');
+            } else {
+                log(`AI STORY generated (${story.length} chars) — ${elapsed}s`, 'log-ok');
+            }
+
+            log(`Total score: ${goldenResult.totalScore}`, 'log-info');
+            log('');
+
+            // Log army
+            log('=== Your Dino Army ===', 'log-info');
+            army.forEach(d => {
+                log(`  ${d.nickname} (${d.name}) — ${d.rarity.toUpperCase()} — Total: ${d.total} — ${d.attributes || 'no attrs'}`, `log-${d.rarity}`);
+            });
+
+            showStory(story, army);
+            setStatus(isFallback ? `Done (fallback) — ${elapsed}s` : `Done! AI story in ${elapsed}s — click "Regenerate Story" to test again`);
+        }
+
+        // ===== RUN FULL GAME =====
+        async function runFullGame() {
+            setButtonsDisabled(true);
+            document.getElementById('log').innerHTML = '';
+            document.getElementById('story-panel').style.display = 'none';
+
+            log(`API: ${getAPI()}`, 'log-dim');
+            log(`User ID: ${userId}`, 'log-dim');
+            log('');
+
+            log('=== Starting full game ===', 'log-info');
+            const ok = await startAndCollectAll();
+            if (!ok) { setButtonsDisabled(false); return; }
+
+            log('');
+            await collectGoldenEggAndShowStory();
+
+            setButtonsDisabled(false);
+            document.getElementById('regenBtn').disabled = false;
+        }
+
+        // ===== REGENERATE STORY ONLY =====
+        // Restarts the session, speed-runs all eggs, then generates a new story.
+        // Use this to iterate on the prompt without changing anything else.
+        async function regenerateStory() {
+            setButtonsDisabled(true);
+            document.getElementById('log').innerHTML = '';
+
+            log(`Regenerating story (new session, same user)...`, 'log-info');
+            log(`API: ${getAPI()}`, 'log-dim');
+            log('');
+
+            const ok = await startAndCollectAll();
+            if (!ok) { setButtonsDisabled(false); return; }
+
+            log('');
+            await collectGoldenEggAndShowStory();
+
+            setButtonsDisabled(false);
+            document.getElementById('regenBtn').disabled = false;
+        }
+
+        async function resetSession() {
+            log('Resetting session...', 'log-info');
+            await post('next', { game_ref: 'dino-hunt', user_id: userId, action: 'restart' });
+            log('Session reset.', 'log-ok');
+            document.getElementById('story-panel').style.display = 'none';
+            document.getElementById('regenBtn').disabled = true;
+            collectedDinos = [];
+            pinMarkers.forEach(m => m.setMap(null));
+            collectionCircles.forEach(c => c.setMap(null));
+            pinMarkers = [];
+            collectionCircles = [];
+            playerMarker?.setPosition(START_POSITION);
+        }
+    </script>
+    <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBvVKx3gK4-AdFH1EAjv0btTYXonqPTess&callback=initMap"></script>
+</body>
+</html>
