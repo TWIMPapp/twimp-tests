@@ -31,7 +31,7 @@ import { pathToFileURL } from 'node:url';
 
 // -------------------------------------------------------------- Config
 
-const API = 'https://api.twimp.app';
+let API = process.env.TWIMP_API || 'https://api.twimp.app'; // override with --api <url>
 const GAMES_DIR = join(import.meta.dirname, '..', 'backend', 'src', 'data', 'games');
 const MAX_WALKS_PER_TRAIL = 20;
 const MAX_STEPS_PER_WALK = 50;
@@ -124,8 +124,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
  * defaults to the first available option AND records the alternatives so
  * the enumerator can fork.
  */
-async function walkPath(trail, decisions, log) {
-    const userId = newUserId();
+async function walkPath(trail, decisions, log, userId = newUserId()) {
     const visited = new Set();
     const stepsActivated = [];
     const decisionsTaken = [];  // each: {kind, atStep, atTask, chose, alternatives}
@@ -406,14 +405,174 @@ function printReport(trail, results) {
     console.log('='.repeat(70));
 }
 
+// -------------------------------------------------------------- State-machine probes
+//
+// Two checks the plain walker doesn't do, both about the engine respecting the
+// trail's intended ordering — driven entirely through the public API:
+//
+//   forward  — from a fresh session you can only reach step 0 (the start map
+//              offers nothing else). awty'ing straight to any later step's
+//              location must NOT activate it. A step that activates here is
+//              reachable out of order — e.g. an ungated step like The Bridge
+//              that fires while you're merely walking past it on the way to
+//              The Pier.
+//
+//   backward — after walking the trail, awty'ing at a previously-visited
+//              location must NOT move the player's progress pointer. We read
+//              the pointer via /play resume before and after each probe.
+//
+// Each runs on throwaway sessions / a session we own, so a violation (which
+// disturbs that session's state) never pollutes the other check.
+
+function taskIdToStepIndex(trail, taskId) {
+    const id = String(taskId);
+    return trail.steps.findIndex(s => String(s.tasks?.[0]?.id) === id);
+}
+
+async function forwardReachabilitySweep(trail) {
+    const start = trail.steps[0]?.location;
+    if (!start) return { results: [], violations: [] };
+
+    // Every step except the start should be unreachable from a brand-new
+    // session. Probe each on its own user_id so they run concurrently — the 5s
+    // awty cooldown is per-session and a fresh session hasn't spent it yet.
+    const targets = trail.steps
+        .map((s, i) => ({ i, s }))
+        .filter(({ i, s }) => i !== 0 && s.location);
+
+    const results = await Promise.all(targets.map(async ({ i, s }) => {
+        const userId = newUserId();
+        await api('/play', { game_ref: trail.ref, user_id: userId, lat: start.lat, lng: start.lng });
+        const probe = await api('/awty', {
+            game_ref: trail.ref, user_id: userId,
+            lat: s.location.lat, lng: s.location.lng, accuracy: ACCURACY,
+        });
+        const activatedTask = probe.body?.task;
+        const activatedIdx = activatedTask ? taskIdToStepIndex(trail, activatedTask.id) : -1;
+        return {
+            index: i, name: s.name,
+            state: s.state ?? null,
+            reachable: !!activatedTask,
+            activatedIndex: activatedIdx,
+            activatedName: activatedIdx >= 0 ? trail.steps[activatedIdx]?.name : null,
+            message: probe.body?.message,
+        };
+    }));
+
+    return { results, violations: results.filter(r => r.reachable) };
+}
+
+async function backwardProgressProbe(trail) {
+    const userId = newUserId();
+    const start = trail.steps[0].location;
+
+    // Progress through the trail (default path) on a session we own.
+    const walk = await walkPath(trail, [], () => {}, userId);
+    const visited = walk.stepsActivated;
+    if (visited.length < 2) {
+        return { skipped: `default walk only reached ${visited.length} step(s) — nothing to revisit`, results: [], violations: [] };
+    }
+
+    // The progress pointer the engine thinks we're on, read via /play resume.
+    const progressOf = async () => {
+        const r = await api('/play', { game_ref: trail.ref, user_id: userId, lat: start.lat, lng: start.lng });
+        return r.body?.task?.id ?? null;
+    };
+    const baseline = await progressOf();
+
+    // Revisit every step except the one we're currently on. Skip can_revisit
+    // steps — re-triggering those is intended, not a regression.
+    const current = visited[visited.length - 1];
+    const toProbe = visited.slice(0, -1).filter(v => {
+        const step = trail.steps[v.index];
+        return step?.location && step.on_search?.can_revisit !== true;
+    });
+
+    const results = [];
+    const violations = [];
+    for (const v of toProbe) {
+        const loc = trail.steps[v.index].location;
+        await sleep(AWTY_COOLDOWN_MS);
+        const probe = await api('/awty', {
+            game_ref: trail.ref, user_id: userId,
+            lat: loc.lat, lng: loc.lng, accuracy: ACCURACY,
+        });
+        const after = await progressOf();
+        const activatedIdx = probe.body?.task ? taskIdToStepIndex(trail, probe.body.task.id) : -1;
+        const row = {
+            index: v.index, name: v.name,
+            reactivated: !!probe.body?.task,
+            activatedIndex: activatedIdx,
+            activatedName: activatedIdx >= 0 ? trail.steps[activatedIdx]?.name : null,
+            progressFrom: baseline, progressTo: after,
+        };
+        results.push(row);
+        if (row.reactivated || after !== baseline) {
+            violations.push(row);
+            break; // progress is now disturbed — stop before later rows get noisy
+        }
+    }
+
+    return { baseline, current, results, violations };
+}
+
+function printProbeReport(trail, forward, backward) {
+    console.log('\n' + '='.repeat(70));
+    console.log(`State-machine probes: ${trail.name} (${trail.ref})`);
+    console.log('='.repeat(70));
+
+    console.log('\nForward — can we reach later steps from a fresh session?');
+    console.log('(every step except the start should be locked)');
+    for (const r of forward.results) {
+        const gate = r.state ? `state=${JSON.stringify(r.state)}` : 'ungated';
+        if (r.reachable) {
+            const via = r.activatedIndex >= 0 && r.activatedIndex !== r.index
+                ? ` (activated step ${r.activatedIndex} "${r.activatedName}")` : '';
+            console.log(`  ❌ step ${r.index} "${r.name}" [${gate}] REACHABLE out of order${via}`);
+        } else {
+            console.log(`  ✅ step ${r.index} "${r.name}" [${gate}] locked — ${r.message || 'no activation'}`);
+        }
+    }
+
+    console.log('\nBackward — does revisiting a past location move progress?');
+    if (backward.skipped) {
+        console.log(`  ⚠️  skipped: ${backward.skipped}`);
+    } else {
+        console.log(`  progress pointer before probes: task ${backward.baseline} (currently on "${backward.current?.name}")`);
+        for (const r of backward.results) {
+            if (r.reactivated || r.progressTo !== r.progressFrom) {
+                const via = r.activatedIndex >= 0 && r.activatedIndex !== r.index
+                    ? ` — re-activated step ${r.activatedIndex} "${r.activatedName}"` : (r.reactivated ? ' (re-activated)' : '');
+                console.log(`  ❌ revisiting step ${r.index} "${r.name}" moved progress ${r.progressFrom} → ${r.progressTo}${via}`);
+            } else {
+                console.log(`  ✅ step ${r.index} "${r.name}" — progress held at ${r.progressTo}`);
+            }
+        }
+    }
+
+    const total = forward.violations.length + backward.violations.length;
+    console.log('\n' + '-'.repeat(70));
+    console.log(total === 0
+        ? '✅ No ordering violations.'
+        : `❌ ${total} ordering violation(s): ${forward.violations.length} forward, ${backward.violations.length} backward.`);
+    console.log('='.repeat(70));
+    return total;
+}
+
 // -------------------------------------------------------------- CLI
 
 async function main() {
     const args = process.argv.slice(2);
     if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
-        console.log('Usage: node test-trail.mjs <trail-ref> [--first] | --list');
+        console.log('Usage: node test-trail.mjs <trail-ref> [--first] [--probe] [--api <url>] | --list');
+        console.log('  --first       walk one path only (smoke test)');
+        console.log('  --probe       run state-machine ordering probes instead of walking paths');
+        console.log('  --api <url>   target a different backend (or set TWIMP_API). Default: live api.twimp.app');
         process.exit(0);
     }
+
+    const apiArg = args.indexOf('--api');
+    if (apiArg >= 0 && args[apiArg + 1]) API = args[apiArg + 1].replace(/\/$/, '');
 
     const trails = await discoverTrails();
 
@@ -425,6 +584,7 @@ async function main() {
 
     const ref = args[0];
     const firstOnly = args.includes('--first');
+    const probe = args.includes('--probe');
 
     const filePath = trails.get(ref);
     if (!filePath) {
@@ -435,6 +595,16 @@ async function main() {
     const raw = await loadTrailFromTs(filePath);
     const trail = resolveTrail(raw);
     console.log(`Loaded ${trail.name} (${trail.ref}) — ${trail.steps.length} steps, ${trail.locations?.length ?? 0} locations`);
+    console.log(`API: ${API}`);
+
+    if (probe) {
+        console.log('\nForward reachability sweep (parallel, fresh sessions)...');
+        const forward = await forwardReachabilitySweep(trail);
+        console.log('Backward progress probe (walking the default path first, then revisiting)...');
+        const backward = await backwardProgressProbe(trail);
+        const violations = printProbeReport(trail, forward, backward);
+        process.exit(violations > 0 ? 1 : 0);
+    }
 
     let results;
     if (firstOnly) {
