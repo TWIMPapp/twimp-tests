@@ -129,6 +129,7 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
     const stepsActivated = [];
     const decisionsTaken = [];  // each: {kind, atStep, atTask, chose, alternatives}
     const events = [];          // free-form log for the report
+    const transcript = [];      // ordered narrative text the player sees along this path
 
     // Engine convention: task = stepIndex * 100 + taskIndex
     let stepIndex = -1;
@@ -137,7 +138,7 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
 
     const startStep = trail.steps[0];
     if (!startStep?.location) {
-        return { ok: false, reason: 'Trail has no startable first step', events, stepsActivated, decisionsTaken };
+        return { ok: false, reason: 'Trail has no startable first step', events, stepsActivated, decisionsTaken, transcript };
     }
 
     // Kick off with /play; first task is the default MapTask listing all visible step locations.
@@ -146,7 +147,7 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
         lat: startStep.location.lat, lng: startStep.location.lng,
     });
     if (playRes.status !== 200 || !playRes.body?.ok) {
-        return { ok: false, reason: `/play failed: ${JSON.stringify(playRes.body)}`, events, stepsActivated, decisionsTaken };
+        return { ok: false, reason: `/play failed: ${JSON.stringify(playRes.body)}`, events, stepsActivated, decisionsTaken, transcript };
     }
     currentTask = playRes.body.task;
     events.push(`/play → task type=${currentTask?.type}`);
@@ -164,21 +165,23 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
         const cycleKey = `${stepIndex}:${taskIndex}`;
         if (visited.has(cycleKey)) {
             events.push(`Cycle detected at ${cycleKey} — aborting branch`);
-            return { ok: false, reason: 'cycle', events, stepsActivated, decisionsTaken };
+            return { ok: false, reason: 'cycle', events, stepsActivated, decisionsTaken, transcript };
         }
         visited.add(cycleKey);
 
         const t = currentTask;
 
         if (t.type === 'finish') {
+            transcript.push({ stepIndex, step: trail.steps[stepIndex]?.name, type: 'finish', content: t.content });
             events.push(`Finished at step ${stepIndex} (${trail.steps[stepIndex]?.name})`);
-            return { ok: true, reason: 'finish', events, stepsActivated, decisionsTaken };
+            return { ok: true, reason: 'finish', events, stepsActivated, decisionsTaken, transcript };
         }
 
         if (t.type === 'information') {
+            transcript.push({ stepIndex, step: trail.steps[stepIndex]?.name, type: 'information', content: t.content });
             const r = await api('/next', { game_ref: trail.ref, user_id: userId });
             if (!r.body?.ok) {
-                return { ok: false, reason: `/next failed on information: ${JSON.stringify(r.body)}`, events, stepsActivated, decisionsTaken };
+                return { ok: false, reason: `/next failed on information: ${JSON.stringify(r.body)}`, events, stepsActivated, decisionsTaken, transcript };
             }
             taskIndex += 1;
             currentTask = r.body.task ?? null;
@@ -193,21 +196,27 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
             const options = srcTask?.options ?? [];
             const positive = options.filter(o => o.response?.sentiment === 'positive');
             if (positive.length === 0) {
-                return { ok: false, reason: `Question has no positive option (step ${stepIndex} task ${taskIndex})`, events, stepsActivated, decisionsTaken };
+                return { ok: false, reason: `Question has no positive option (step ${stepIndex} task ${taskIndex})`, events, stepsActivated, decisionsTaken, transcript };
             }
 
+            // An option's content may be a string or an array of equivalent
+            // accepted answers (e.g. ["1956","56"]). Collapse to a single
+            // representative answer so multi-spelling options don't fork the walk.
+            const answerOf = o => Array.isArray(o.content) ? o.content[0] : o.content;
             const dec = decisions[decisionPtr++];
-            const choice = (dec && dec.kind === 'question' && positive.find(o => o.content === dec.chose)) || positive[0];
-            const alternatives = positive.length > 1 ? positive.map(o => o.content).filter(c => c !== choice.content) : [];
+            const choice = (dec && dec.kind === 'question' && positive.find(o => answerOf(o) === dec.chose)) || positive[0];
+            const answerStr = answerOf(choice);
+            const alternatives = positive.length > 1 ? positive.map(answerOf).filter(c => c !== answerStr) : [];
             decisionsTaken.push({
                 kind: 'question', atStep: stepIndex, atTask: taskIndex,
-                chose: choice.content, alternatives,
+                chose: answerStr, alternatives,
                 stepName: srcStep.name,
             });
+            transcript.push({ stepIndex, step: srcStep?.name, type: 'question', content: t.content, answer: answerStr });
 
-            const r = await api('/next', { game_ref: trail.ref, user_id: userId, answer: choice.content });
+            const r = await api('/next', { game_ref: trail.ref, user_id: userId, answer: answerStr });
             if (!r.body?.ok) {
-                return { ok: false, reason: `/next failed on question: ${JSON.stringify(r.body)}`, events, stepsActivated, decisionsTaken };
+                return { ok: false, reason: `/next failed on question: ${JSON.stringify(r.body)}`, events, stepsActivated, decisionsTaken, transcript };
             }
             taskIndex += 1;
             currentTask = r.body.task ?? null;
@@ -234,7 +243,7 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
             }).filter(Boolean);
 
             if (resolved.length === 0) {
-                return { ok: false, reason: 'Map task has no resolvable markers', events, stepsActivated, decisionsTaken };
+                return { ok: false, reason: 'Map task has no resolvable markers', events, stepsActivated, decisionsTaken, transcript };
             }
 
             let choice, alternatives;
@@ -256,6 +265,7 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
                     chose: choice.id, alternatives,
                     choseName: choice.name,
                 });
+                transcript.push({ stepIndex, step: trail.steps[stepIndex]?.name, type: 'map', content: t.content, chose: choice.name });
             }
 
             if (needsAwtyCooldown) await sleep(AWTY_COOLDOWN_MS);
@@ -272,7 +282,7 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
                 return {
                     ok: false, reason: 'no-activation',
                     deadEndAt: { stepIndex, taskIndex, markerName: choice.name, markerId: choice.id },
-                    events, stepsActivated, decisionsTaken,
+                    events, stepsActivated, decisionsTaken, transcript,
                 };
             }
 
@@ -290,10 +300,10 @@ async function walkPath(trail, decisions, log, userId = newUserId()) {
         }
 
         events.push(`Unknown task type "${t.type}" — ending walk`);
-        return { ok: false, reason: `unknown task type: ${t.type}`, events, stepsActivated, decisionsTaken };
+        return { ok: false, reason: `unknown task type: ${t.type}`, events, stepsActivated, decisionsTaken, transcript };
     }
 
-    return { ok: false, reason: 'max-steps', events, stepsActivated, decisionsTaken };
+    return { ok: false, reason: 'max-steps', events, stepsActivated, decisionsTaken, transcript };
 }
 
 // -------------------------------------------------------------- Enumerator
@@ -452,6 +462,8 @@ async function forwardReachabilitySweep(trail) {
         return {
             index: i, name: s.name,
             state: s.state ?? null,
+            requiredSteps: s.requiredSteps ?? null,
+            requiredItems: s.requiredItems ?? null,
             reachable: !!activatedTask,
             activatedIndex: activatedIdx,
             activatedName: activatedIdx >= 0 ? trail.steps[activatedIdx]?.name : null,
@@ -524,7 +536,11 @@ function printProbeReport(trail, forward, backward) {
     console.log('\nForward — can we reach later steps from a fresh session?');
     console.log('(every step except the start should be locked)');
     for (const r of forward.results) {
-        const gate = r.state ? `state=${JSON.stringify(r.state)}` : 'ungated';
+        const gateParts = [];
+        if (r.state) gateParts.push(`state=${JSON.stringify(r.state)}`);
+        if (r.requiredSteps?.length) gateParts.push(`requiredSteps=${JSON.stringify(r.requiredSteps)}`);
+        if (r.requiredItems?.length) gateParts.push(`requiredItems=${JSON.stringify(r.requiredItems)}`);
+        const gate = gateParts.length ? gateParts.join(' ') : 'ungated';
         if (r.reachable) {
             const via = r.activatedIndex >= 0 && r.activatedIndex !== r.index
                 ? ` (activated step ${r.activatedIndex} "${r.activatedName}")` : '';
@@ -559,15 +575,55 @@ function printProbeReport(trail, forward, backward) {
     return total;
 }
 
+// -------------------------------------------------------------- Route text export
+//
+// Turns a walk's captured transcript into a readable markdown document — the
+// exact narrative a player reads on that route, in order, grouped by location,
+// with question answers and map hops noted. Lets us eyeball each route for
+// continuity errors / contradictions across branches.
+
+function transcriptToMarkdown(trail, result, n) {
+    const path = result.stepsActivated.map(s => s.name).join(' → ');
+    let md = `# Route ${n}: ${path}\n\n`;
+    md += `> ${result.ok ? 'Completed' : `Stopped (${result.reason})`}\n\n`;
+
+    let lastStep = null;
+    for (const e of result.transcript) {
+        if (e.step !== lastStep) {
+            md += `\n## ${e.step || '(start)'}\n\n`;
+            lastStep = e.step;
+        }
+        if (e.type === 'information') md += `${e.content}\n\n`;
+        else if (e.type === 'finish') md += `${e.content}\n\n*— ending —*\n\n`;
+        else if (e.type === 'question') md += `**[Question]** ${e.content}\n**[Answer]** ${e.answer}\n\n`;
+        else if (e.type === 'map') md += `*→ ${e.content} (heading to ${e.chose})*\n\n`;
+    }
+    return md;
+}
+
+async function writeRouteFiles(trail, results, dir) {
+    await mkdir(dir, { recursive: true });
+    // Only export distinct completed routes — that's what "the N routes" means.
+    const completed = results.filter(r => r.ok && r.reason === 'finish' && r.transcript?.length);
+    const written = [];
+    for (let i = 0; i < completed.length; i++) {
+        const file = join(dir, `route-${i + 1}.md`);
+        await writeFile(file, transcriptToMarkdown(trail, completed[i], i + 1), 'utf8');
+        written.push({ file, path: completed[i].stepsActivated.map(s => s.name).join(' → ') });
+    }
+    return written;
+}
+
 // -------------------------------------------------------------- CLI
 
 async function main() {
     const args = process.argv.slice(2);
     if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
-        console.log('Usage: node test-trail.mjs <trail-ref> [--first] [--probe] [--api <url>] | --list');
-        console.log('  --first       walk one path only (smoke test)');
-        console.log('  --probe       run state-machine ordering probes instead of walking paths');
-        console.log('  --api <url>   target a different backend (or set TWIMP_API). Default: live api.twimp.app');
+        console.log('Usage: node test-trail.mjs <trail-ref> [--first] [--probe] [--export [dir]] [--api <url>] | --list');
+        console.log('  --first         walk one path only (smoke test)');
+        console.log('  --probe         run state-machine ordering probes instead of walking paths');
+        console.log('  --export [dir]  enumerate all routes and write each route\'s narrative text to a markdown file');
+        console.log('  --api <url>     target a different backend (or set TWIMP_API). Default: live api.twimp.app');
         process.exit(0);
     }
 
@@ -585,6 +641,8 @@ async function main() {
     const ref = args[0];
     const firstOnly = args.includes('--first');
     const probe = args.includes('--probe');
+    const exportIdx = args.indexOf('--export');
+    const exportMode = exportIdx >= 0;
 
     const filePath = trails.get(ref);
     if (!filePath) {
@@ -607,7 +665,7 @@ async function main() {
     }
 
     let results;
-    if (firstOnly) {
+    if (firstOnly && !exportMode) {
         const t0 = Date.now();
         const r = await walkPath(trail, [], () => {});
         results = [{ ...r, prefix: [], ms: Date.now() - t0 }];
@@ -616,6 +674,14 @@ async function main() {
     }
 
     printReport(trail, results);
+
+    if (exportMode) {
+        const dirArg = args[exportIdx + 1];
+        const dir = dirArg && !dirArg.startsWith('--') ? dirArg : join(import.meta.dirname, 'routes', trail.ref);
+        const written = await writeRouteFiles(trail, results, dir);
+        console.log(`\nWrote ${written.length} route(s) to ${dir}:`);
+        written.forEach((w, i) => console.log(`  route-${i + 1}.md  ${w.path}`));
+    }
 
     const anyFatal = results.some(r => !r.ok && r.reason !== 'no-activation' && r.reason !== 'cycle');
     process.exit(anyFatal ? 1 : 0);
